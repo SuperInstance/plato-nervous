@@ -488,6 +488,261 @@ pub enum SignalResolution {
     Escalated(Tile, String),
 }
 
+// ── Distillation Pipeline ─────────────────────────────────────────────
+// Each layer is both a RESOLVER and a DISTILLER. When a lower layer resolves
+// a reading, it produces a training example for the layer above. When a
+// higher layer resolves what a lower layer couldn't, its response becomes
+// training data for the lower layer's LoRA.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillationRecord {
+    pub input_hash: u64,
+    pub layer_resolved: ResolutionLayer,
+    pub confidence: f64,
+    /// Time taken to resolve (ms)
+    pub latency_ms: u64,
+    /// Was this resolved correctly? (determined by downstream verification)
+    pub verified_correct: Option<bool>,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillationStats {
+    /// How many tiles have been used for LoRA training so far
+    pub total_tiles_used: usize,
+    /// Accuracy of the nano model BEFORE last distillation
+    pub pre_distillation_accuracy: f64,
+    /// Accuracy AFTER last distillation
+    pub post_distillation_accuracy: f64,
+    /// Number of distillation cycles completed
+    pub distillation_cycles: usize,
+    /// Conservation ratio at each layer transition
+    pub cr_l0_to_l1: f64,
+    pub cr_l1_to_l2: f64,
+    pub cr_l2_to_l3: f64,
+    pub cr_l3_to_l4: f64,
+    /// Cloud call reduction after each cycle
+    pub cloud_reduction_pct: f64,
+}
+
+impl Default for DistillationStats {
+    fn default() -> Self {
+        Self {
+            total_tiles_used: 0,
+            pre_distillation_accuracy: 0.0,
+            post_distillation_accuracy: 0.0,
+            distillation_cycles: 0,
+            cr_l0_to_l1: 0.99, // Algorithmic is near-perfect
+            cr_l1_to_l2: 0.0,  // No LoRA yet
+            cr_l2_to_l3: 0.0,
+            cr_l3_to_l4: 0.0,
+            cloud_reduction_pct: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillationConfig {
+    /// Minimum tiles before first distillation
+    pub min_tiles_for_lora: usize,
+    /// Minimum HIGH-QUALITY tiles (quality > 0.7) needed
+    pub min_high_quality_tiles: usize,
+    /// LoRA rank for room-specific adapter
+    pub lora_rank: usize,
+    /// How often to re-distill (in readings processed)
+    pub redistillation_interval: usize,
+    /// CR threshold below which re-distillation triggers
+    pub cr_redistillation_threshold: f64,
+    /// Maximum LoRA training epochs
+    pub max_epochs: usize,
+}
+
+impl Default for DistillationConfig {
+    fn default() -> Self {
+        Self {
+            min_tiles_for_lora: 100,
+            min_high_quality_tiles: 50,
+            lora_rank: 8,
+            redistillation_interval: 1000,
+            cr_redistillation_threshold: 0.85,
+            max_epochs: 10,
+        }
+    }
+}
+
+// ── JEPA-like Room Perception (The Irreducible Core) ──────────────────
+// After weeks of operation, each room develops a self-model — a compressed
+// representation of its own state that captures holistic patterns no single
+// sensor reading can express. This is the JEPA nano-model.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomStateVector {
+    pub room_id: String,
+    /// Compressed state of the room (16 dimensions)
+    /// Each dimension captures a holistic aspect:
+    ///   [0] - overall health (0 = critical, 1 = perfect)
+    ///   [1] - thermal trend (negative = cooling, positive = heating)
+    ///   [2] - vibration signature (higher = more vibration)
+    ///   [3] - stress level (cognitive load on the room)
+    ///   [4] - drift rate (how fast things are changing)
+    ///   [5-7] - cross-sensor correlations (RPM↔coolant, RPM↔oil, coolant↔oil)
+    ///   [8-11] - temporal patterns (hourly, daily, weekly, seasonal)
+    ///   [12-15] - reserved for room-specific dimensions
+    pub state: [f32; 16],
+    /// Confidence in the state vector (how well the JEPA model knows this state)
+    pub confidence: f64,
+    pub timestamp_ms: u64,
+}
+
+impl RoomStateVector {
+    pub fn health(&self) -> f32 { self.state[0] }
+    pub fn thermal_trend(&self) -> f32 { self.state[1] }
+    pub fn vibration(&self) -> f32 { self.state[2] }
+    pub fn stress(&self) -> f32 { self.state[3] }
+    pub fn drift_rate(&self) -> f32 { self.state[4] }
+    
+    /// Is the room in a known-good state? (health > 0.7, low stress)
+    pub fn is_healthy(&self) -> bool {
+        self.state[0] > 0.7 && self.state[3] < 0.3
+    }
+    
+    /// Is the room in an anomalous state? (low health OR high stress)
+    pub fn is_anomalous(&self) -> bool {
+        self.state[0] < 0.3 || self.state[3] > 0.7
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JepaNanoConfig {
+    /// Input embedding dimension (from the 350M model's output)
+    pub input_dim: usize,
+    /// Room state vector dimension
+    pub state_dim: usize,
+    /// Model size in parameters (1M-10M for edge deployment)
+    pub param_count: usize,
+    /// Prediction horizon (how far ahead the JEPA model predicts)
+    pub prediction_horizon_ms: u64,
+}
+
+impl Default for JepaNanoConfig {
+    fn default() -> Self {
+        Self {
+            input_dim: 384,   // Standard small embedding dim
+            state_dim: 16,    // Room state vector
+            param_count: 2_000_000, // 2M params — fits in ~4MB
+            prediction_horizon_ms: 60_000, // Predict 1 minute ahead
+        }
+    }
+}
+
+/// The JEPA (Joint Embedding Predictive Architecture) nano-model
+/// This is the irreducible core — the room's self-model.
+/// It doesn't process language. It processes embeddings.
+/// Its job: predict the NEXT room state from the current state.
+/// When predictions diverge from reality, that's anomaly detection
+/// that no threshold or rule could ever catch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JepaNano {
+    pub config: JepaNanoConfig,
+    /// The learned state transition matrix (state_dim × state_dim)
+    /// In a real implementation, this would be a small neural net.
+    /// Here it's a simple linear model for demonstration.
+    pub transition_weights: Vec<Vec<f32>>,
+    /// Running average prediction error (used for anomaly detection)
+    pub avg_prediction_error: f64,
+    /// Number of states processed
+    pub states_processed: u64,
+    /// Last predicted state
+    pub last_prediction: Option<RoomStateVector>,
+}
+
+impl JepaNano {
+    pub fn new(config: JepaNanoConfig) -> Self {
+        let dim = config.state_dim;
+        // Initialize with identity-like weights (predict current = next)
+        let mut weights = vec![vec![0.0f32; dim]; dim];
+        for i in 0..dim {
+            weights[i][i] = 0.9; // Slight decay toward zero
+        }
+        Self {
+            config,
+            transition_weights: weights,
+            avg_prediction_error: 0.0,
+            states_processed: 0,
+            last_prediction: None,
+        }
+    }
+    
+    /// Predict the next room state from the current state
+    pub fn predict(&self, current: &RoomStateVector) -> RoomStateVector {
+        let dim = self.config.state_dim;
+        let mut next_state = [0.0f32; 16];
+        
+        for i in 0..dim.min(16) {
+            let mut val = 0.0f32;
+            for j in 0..dim.min(16) {
+                val += self.transition_weights[i][j] * current.state[j];
+            }
+            next_state[i] = val;
+        }
+        
+        RoomStateVector {
+            room_id: current.room_id.clone(),
+            state: next_state,
+            confidence: current.confidence * 0.95, // Confidence decays
+            timestamp_ms: current.timestamp_ms + self.config.prediction_horizon_ms,
+        }
+    }
+    
+    /// Update the model with an actual observation
+    /// Returns the prediction error (how surprised the model was)
+    pub fn update(&mut self, actual: &RoomStateVector) -> f64 {
+        let error = if let Some(ref predicted) = self.last_prediction {
+            let mut total_error = 0.0f64;
+            for i in 0..16 {
+                total_error += (predicted.state[i] - actual.state[i]).powi(2) as f64;
+            }
+            (total_error / 16.0).sqrt() // RMSE
+        } else {
+            0.0
+        };
+        
+        // Update running average
+        self.states_processed += 1;
+        let alpha = 1.0 / self.states_processed.min(100) as f64;
+        self.avg_prediction_error = self.avg_prediction_error * (1.0 - alpha) + error * alpha;
+        
+        // Online learning: nudge weights toward the actual transition
+        // (In production, this would be a proper gradient step)
+        if let Some(ref predicted) = self.last_prediction {
+            let lr = 0.01; // Learning rate
+            for i in 0..self.config.state_dim.min(16) {
+                let delta = actual.state[i] - predicted.state[i];
+                for j in 0..self.config.state_dim.min(16) {
+                    self.transition_weights[i][j] += lr * delta * actual.state[j];
+                }
+            }
+        }
+        
+        // Set up next prediction
+        self.last_prediction = Some(self.predict(actual));
+        
+        error
+    }
+    
+    /// Is the current prediction error anomalously high?
+    /// This is the JEPA anomaly detection — when the model is surprised.
+    pub fn is_surprised(&self, error: f64) -> bool {
+        if self.states_processed < 10 { return false; }
+        error > self.avg_prediction_error * 3.0 // 3σ threshold
+    }
+    
+    /// How "well-trained" is this model? (0 = newborn, 1 = fully trained)
+    pub fn maturity(&self) -> f64 {
+        (self.states_processed as f64 / 10000.0).min(1.0)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -656,7 +911,7 @@ mod tests {
                 timestamp_ms: i * 1000,
                 normal_min: 1400.0, normal_max: 1500.0,
             };
-            ns.process(reading);
+            ns.process(reading.clone());
         }
 
         // Most should be resolved algorithmically
@@ -679,7 +934,7 @@ mod tests {
                 timestamp_ms: i * 1000,
                 normal_min: 140.0, normal_max: 210.0,
             };
-            ns.process(reading);
+            ns.process(reading.clone());
         }
 
         // Now send an anomaly
@@ -710,7 +965,7 @@ mod tests {
 
         for i in 0..15 {
             let reading = make_reading("temp", 20.0 + i as f64, 0.0, 100.0);
-            ns.process(reading);
+            ns.process(reading.clone());
         }
 
         assert_eq!(ns.tile_buffer.len(), 10); // Capped at max
@@ -725,14 +980,14 @@ mod tests {
         // Not ready with few tiles
         for i in 0..50 {
             let reading = make_reading("temp", 20.0, 0.0, 100.0);
-            ns.process(reading);
+            ns.process(reading.clone());
         }
         assert!(!ns.ready_for_lora());
 
         // Ready after 100+ tiles with good quality
         for i in 0..100 {
             let reading = make_reading("temp", 20.0 + i as f64 * 0.01, 0.0, 100.0);
-            ns.process(reading);
+            ns.process(reading.clone());
         }
         assert!(ns.ready_for_lora());
     }
@@ -766,5 +1021,180 @@ mod tests {
         assert!((dist.algorithmic_pct - 80.0).abs() < 1.0);
         assert!((dist.cloud_pct - 20.0).abs() < 1.0);
         assert!((dist.autonomy - 0.8).abs() < 0.01);
+    }
+
+    // ── Distillation Pipeline Tests ────────────────────────────────
+
+    #[test]
+    fn test_distillation_config_defaults() {
+        let config = DistillationConfig::default();
+        assert_eq!(config.min_tiles_for_lora, 100);
+        assert_eq!(config.lora_rank, 8);
+        assert!(config.cr_redistillation_threshold > 0.0);
+    }
+
+    #[test]
+    fn test_distillation_stats_defaults() {
+        let stats = DistillationStats::default();
+        assert_eq!(stats.distillation_cycles, 0);
+        assert!(stats.cr_l0_to_l1 > 0.9); // Algorithmic layer is near-perfect
+    }
+
+    // ── JEPA Nano-Model Tests ──────────────────────────────────────
+
+    fn make_state(room_id: &str, health: f32, thermal: f32, stress: f32) -> RoomStateVector {
+        let mut state = [0.0f32; 16];
+        state[0] = health;
+        state[1] = thermal;
+        state[3] = stress;
+        RoomStateVector {
+            room_id: room_id.to_string(),
+            state, confidence: 0.9, timestamp_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn test_jepa_nano_creation() {
+        let jepa = JepaNano::new(JepaNanoConfig::default());
+        assert_eq!(jepa.states_processed, 0);
+        assert_eq!(jepa.avg_prediction_error, 0.0);
+        assert!(jepa.last_prediction.is_none());
+    }
+
+    #[test]
+    fn test_jepa_prediction() {
+        let jepa = JepaNano::new(JepaNanoConfig::default());
+        let current = make_state("engine-room", 0.8, 0.1, 0.2);
+        let predicted = jepa.predict(&current);
+        
+        // Diagonal weights are 0.9, so prediction should be close to current
+        assert!((predicted.state[0] - 0.8 * 0.9).abs() < 0.01);
+        assert!((predicted.state[1] - 0.1 * 0.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_jepa_learning() {
+        let mut jepa = JepaNano::new(JepaNanoConfig::default());
+        
+        // Feed stable states — model should learn the pattern
+        for i in 0..50 {
+            let state = make_state("room", 0.8, 0.1 + i as f32 * 0.001, 0.2);
+            jepa.update(&state);
+        }
+        
+        assert!(jepa.states_processed == 50);
+        assert!(jepa.avg_prediction_error < 1.0); // Should be learning
+        assert!(jepa.last_prediction.is_some());
+    }
+
+    #[test]
+    fn test_jepa_anomaly_detection() {
+        let mut jepa = JepaNano::new(JepaNanoConfig::default());
+        
+        // Train on stable states
+        for _ in 0..100 {
+            let state = make_state("room", 0.8, 0.1, 0.2);
+            jepa.update(&state);
+        }
+        
+        // Normal reading — should not be surprised
+        let normal = make_state("room", 0.8, 0.1, 0.2);
+        let normal_error = jepa.update(&normal);
+        assert!(!jepa.is_surprised(normal_error));
+        
+        // Anomalous reading — should be surprised
+        let anomaly = make_state("room", 0.1, 0.9, 0.95);
+        let anomaly_error = jepa.update(&anomaly);
+        assert!(jepa.is_surprised(anomaly_error));
+    }
+
+    #[test]
+    fn test_jepa_maturity() {
+        let mut jepa = JepaNano::new(JepaNanoConfig::default());
+        assert_eq!(jepa.maturity(), 0.0); // Newborn
+        
+        for _ in 0..5000 {
+            let state = make_state("room", 0.8, 0.1, 0.2);
+            jepa.update(&state);
+        }
+        assert!(jepa.maturity() > 0.4);
+        assert!(jepa.maturity() < 1.0);
+        
+        for _ in 0..5000 {
+            let state = make_state("room", 0.8, 0.1, 0.2);
+            jepa.update(&state);
+        }
+        assert!((jepa.maturity() - 1.0).abs() < 0.01); // Fully mature
+    }
+
+    #[test]
+    fn test_room_state_vector_accessors() {
+        let mut sv = make_state("room", 0.8, 0.3, 0.2);
+        sv.state[2] = 0.4; // vibration
+        sv.state[4] = 0.1; // drift rate
+        
+        assert!((sv.health() - 0.8).abs() < 0.01);
+        assert!((sv.thermal_trend() - 0.3).abs() < 0.01);
+        assert!((sv.vibration() - 0.4).abs() < 0.01);
+        assert!((sv.stress() - 0.2).abs() < 0.01);
+        assert!((sv.drift_rate() - 0.1).abs() < 0.01);
+        assert!(sv.is_healthy());
+        assert!(!sv.is_anomalous());
+    }
+
+    #[test]
+    fn test_room_state_vector_anomalous() {
+        let sv = make_state("room", 0.1, 0.3, 0.9); // Low health, high stress
+        assert!(!sv.is_healthy());
+        assert!(sv.is_anomalous());
+    }
+
+    #[test]
+    fn test_full_signal_chain_with_jepa() {
+        // Simulate the full lifecycle: deadband → nano → cloud → JEPA
+        let mut ns = RoomNervousSystem::new("engine-room", "Engine Room");
+        ns.deadband_filters.push(DeadbandFilter::new(10.0));
+        
+        let mut jepa = JepaNano::new(JepaNanoConfig::default());
+        
+        // Phase 1: Normal operation — deadband catches most, JEPA learns the pattern
+        for i in 0..200 {
+            let reading = SensorReading {
+                sensor_id: "rpm".to_string(),
+                room_id: "engine-room".to_string(),
+                value: 1450.0 + (i as f64 * 0.1).sin() * 5.0,
+                unit: "rpm".to_string(),
+                timestamp_ms: i * 1000,
+                normal_min: 1400.0, normal_max: 1500.0,
+            };
+            ns.process(reading.clone());
+            
+            // Feed to JEPA as well
+            let mut state = [0.0f32; 16];
+            state[0] = 0.85; // healthy
+            state[1] = (reading.value as f32 - 1450.0) / 50.0; // normalized thermal
+            jepa.update(&RoomStateVector {
+                room_id: "engine-room".to_string(),
+                state, confidence: 0.9, timestamp_ms: reading.timestamp_ms,
+            });
+        }
+        
+        // Most resolved by deadband, JEPA has learned the pattern
+        assert!(ns.autonomy_level() > 0.9);
+        assert!(jepa.maturity() > 0.01);
+        assert!(jepa.avg_prediction_error < 1.0);
+        
+        // Phase 2: Anomaly — JEPA should be surprised
+        let mut anomaly_state = [0.0f32; 16];
+        anomaly_state[0] = 0.2; // Low health
+        anomaly_state[1] = 0.8; // High thermal trend
+        anomaly_state[3] = 0.9; // High stress
+        let anomaly_error = jepa.update(&RoomStateVector {
+            room_id: "engine-room".to_string(),
+            state: anomaly_state, confidence: 0.5, timestamp_ms: 200000,
+        });
+        
+        // JEPA should be surprised by the anomaly
+        assert!(jepa.is_surprised(anomaly_error));
     }
 }
