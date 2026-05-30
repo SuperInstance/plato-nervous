@@ -86,6 +86,32 @@ CR tracks distillation quality at each layer transition:
 - L2 → L3: CR ≈ 0.90 (room to fleet, coordination overhead)
 - L3 → L4: CR ≈ 0.80 (fleet to cloud, context compression)
 
+## Ecosystem
+
+plato-nervous is the core of the **PLATO Nervous System** — a room-specific intelligence signal chain.
+
+**Where this sits:** Layers 0 (deadband), 1 (nano 350M), and 3 (fleet 1.2B), plus the distillation pipeline. This is the backbone crate.
+
+**Signal chain:**
+```
+Sensor → Deadband(L0) → Nano 350M(L1) → Room LoRA(L2) → Fleet 1.2B(L3) → Cloud(L4)
+         plato-nervous    plato-nervous    distillation    plato-nervous     BYOK
+         vision-jepa      concrete-token   pipeline        luciddreamer      
+         audio-jepa       demo             plato-browser                     
+```
+
+| Repo | Role |
+|------|------|
+| [plato-vision-jepa](https://github.com/SuperInstance/plato-vision-jepa) | 16-dim vision state vectors for RoomStateVector fusion |
+| [plato-audio-jepa](https://github.com/SuperInstance/plato-audio-jepa) | 16-dim audio state vectors for RoomStateVector fusion |
+| [concrete-token-demo](https://github.com/SuperInstance/concrete-token-demo) | CLI demo exercising this crate end-to-end |
+| [plato-browser](https://github.com/SuperInstance/plato-browser) | Browser-native zero-install demo (Chrome built-in AI) |
+| [luciddreamer-ai](https://github.com/SuperInstance/luciddreamer-ai) | Cloud-layer reactive improv podcast engine |
+| [openconstruct-kernel](https://github.com/SuperInstance/openconstruct-kernel) | Hardware detection feeding raw sensor ticks into L0 |
+| [hermit-crab](https://github.com/SuperInstance/hermit-crab) | Agent migration between rooms with CR tracking |
+
+See [DEPENDENCIES.md](./DEPENDENCIES.md) for detailed dependency and data flow information.
+
 ## License
 
 Apache 2.0
