@@ -231,7 +231,7 @@ impl NanoModel {
     /// Process a reading through the nano model
     /// In production, this calls llama.cpp/ollama. Here we simulate.
     pub fn infer(&mut self, reading: &SensorReading) -> Option<(Tile, f64)> {
-        let prompt = self.prompt_template
+        let _prompt = self.prompt_template
             .replace("{sensor_id}", &reading.sensor_id)
             .replace("{value}", &format!("{:.1}", reading.value))
             .replace("{unit}", &reading.unit)
@@ -308,7 +308,7 @@ pub struct RoomNervousSystem {
     pub stats: NervousSystemStats,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NervousSystemStats {
     pub total_readings: u64,
     pub resolved_algorithmic: u64,
@@ -319,16 +319,7 @@ pub struct NervousSystemStats {
     pub tiles_produced: u64,
 }
 
-impl Default for NervousSystemStats {
-    fn default() -> Self {
-        Self {
-            total_readings: 0, resolved_algorithmic: 0,
-            resolved_nano: 0, resolved_lora: 0,
-            resolved_fleet: 0, escalated_cloud: 0,
-            tiles_produced: 0,
-        }
-    }
-}
+
 
 impl RoomNervousSystem {
     pub fn new(room_id: &str, room_name: &str) -> Self {
@@ -466,9 +457,7 @@ impl RoomNervousSystem {
         let current_cloud_pct = self.stats.escalated_cloud as f64 
             / self.stats.total_readings.max(1) as f64;
         // LoRA typically absorbs 80% of what nano can't handle
-        let after_nano = current_cloud_pct * 0.2;
-        let after_lora = after_nano * 0.2;
-        after_lora
+        current_cloud_pct * 0.2 * 0.2
     }
 }
 
@@ -663,8 +652,8 @@ impl JepaNano {
         let dim = config.state_dim;
         // Initialize with identity-like weights (predict current = next)
         let mut weights = vec![vec![0.0f32; dim]; dim];
-        for i in 0..dim {
-            weights[i][i] = 0.9; // Slight decay toward zero
+        for (i, row) in weights.iter_mut().enumerate() {
+            row[i] = 0.9; // Slight decay toward zero
         }
         Self {
             config,
@@ -680,12 +669,13 @@ impl JepaNano {
         let dim = self.config.state_dim;
         let mut next_state = [0.0f32; 16];
         
-        for i in 0..dim.min(16) {
+        let limit = dim.min(16);
+        for (i, ns) in next_state.iter_mut().enumerate().take(limit) {
             let mut val = 0.0f32;
-            for j in 0..dim.min(16) {
-                val += self.transition_weights[i][j] * current.state[j];
+            for (j, &s) in current.state.iter().enumerate().take(limit) {
+                val += self.transition_weights[i][j] * s;
             }
-            next_state[i] = val;
+            *ns = val;
         }
         
         RoomStateVector {
