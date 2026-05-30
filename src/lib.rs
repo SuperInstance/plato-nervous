@@ -7,6 +7,8 @@
 //! Signal chain: Sensor → Deadband → Nano → LoRA → Fleet → Cloud
 //! Each layer resolves what it can and passes the rest up.
 
+pub mod ollama;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
