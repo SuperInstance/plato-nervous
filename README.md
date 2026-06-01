@@ -1,117 +1,87 @@
 # plato-nervous
 
-Room-specific model distillation for PLATO rooms. The nervous system that lets rooms handle their own intelligence locally.
+> The full PLATO signal chain: Sensor → Deadband → Nano → LoRA → Fleet → Cloud
 
-## The Signal Chain
+## What This Does
 
+plato-nervous implements PLATO's tiered intelligence pipeline. Sensor readings come in at the bottom and each layer resolves what it can, escalating only the hard problems upward. Most readings are handled by simple algorithmic filters (deadband). A few need the nano-model. Rarely, a room-specific LoRA adapter. Almost never, the cloud LLM.
+
+This is the nervous system: fast local reflexes, slower centralized reasoning.
+
+## The Key Idea
+
+Your spinal cord pulls your hand from a hot stove before your brain knows what happened. PLATO works the same way: Layer 0 (algorithmic deadband) handles 90%+ of readings in microseconds, Layer 1 (nano-model) catches anomalies in milliseconds, Layer 2 (room LoRA) handles room-specific patterns, Layer 3 (fleet coordinator) sees cross-room effects, and Layer 4 (cloud) handles genuinely novel situations.
+
+Each resolution produces a "tile" — a resolved observation that records what was found and who resolved it. As tiles accumulate per room, they become training data for distilling room-specific LoRA adapters.
+
+## Install
+
+```bash
+cargo add plato-nervous
 ```
-Sensor → Deadband Filter → Nano Model (350M) → Room LoRA → Fleet Coord → Cloud
-         Layer 0 (free)     Layer 1 (~250MB)    Layer 2     Layer 3      Layer 4
-```
 
-Each layer resolves what it can. Only the remainder reaches the next layer. After distillation, rooms handle 99% of situations locally.
-
-## Architecture
-
-- **Layer 0**: Pure algorithmic — deadband filters, threshold rules, format conversion. Zero parameters, zero latency.
-- **Layer 1**: Nano model (Liquid LFM2.5-350M, ~250MB) — anomaly detection, pattern recognition. Runs on ESP32.
-- **Layer 2**: Room LoRA (350M base + 5-15M adapter) — room-specific reasoning trained on tile history.
-- **Layer 3**: Fleet coordinator (1.2B) — cross-room coordination, delegation.
-- **Layer 4**: Cloud LLM — novel situations only. Goal: <1% of calls reach here.
-
-## Usage
+## Quick Start
 
 ```rust
-use plato_nervous::{RoomNervousSystem, DeadbandFilter, Rule, RuleCondition, SensorReading};
+use plato_nervous::*;
 
-let mut ns = RoomNervousSystem::new("engine-room", "Engine Room");
-
-// Layer 0: Deadband filters (algorithmic)
-ns.deadband_filters.push(DeadbandFilter::new(5.0));
-ns.rules.push(Rule {
-    name: "high_coolant".into(),
-    condition: RuleCondition::AboveThreshold { sensor_id: "coolant".into(), threshold: 210.0 },
-    tile_content: "Coolant above 210F!".into(),
-});
-
-// Process sensor readings through the signal chain
+// Create a sensor reading
 let reading = SensorReading {
-    sensor_id: "rpm".into(),
-    room_id: "engine-room".into(),
-    value: 1450.0,
-    unit: "rpm".into(),
-    timestamp_ms: 1000,
-    normal_min: 1400.0,
-    normal_max: 1500.0,
+    sensor_id: "temp-001".into(),
+    room_id: "kitchen".into(),
+    value: 22.5,
+    unit: "celsius".into(),
+    timestamp_ms: 1700000000000,
+    normal_min: 15.0,
+    normal_max: 30.0,
 };
 
-match ns.process(reading) {
-    SignalResolution::Algorithmic(tile) => println!("Resolved by rules: {}", tile.content),
-    SignalResolution::NanoModel(tile, conf) => println!("Resolved by nano model ({:.0}%): {}", conf*100.0, tile.content),
-    SignalResolution::Escalated(tile, reason) => println!("ESCALATED: {} — {}", tile.content, reason),
-    _ => {}
+// Layer 0: Deadband filter (most readings stop here)
+let mut deadband = DeadbandFilter { deadband: 0.5, last_value: None };
+if deadband.should_pass(reading.value) {
+    // Value changed significantly — create a tile
 }
-
-// Check autonomy level
-println!("Autonomy: {:.0}%", ns.autonomy_level() * 100.0);
 ```
 
-## Model Benchmarks (Local, CPU-only, 24-core)
+## API Reference
 
-### Anomaly Detection (should say ALERT)
+### Core Types
 
-| Model | Size | Correct? | Latency |
-|-------|------|----------|---------|
-| Liquid LFM2.5-1.2B | 698MB | ✅ ALERT | 1.9s |
-| phi4-mini | 2.5GB | ✅ ALERT | 9.4s |
-| gemma3:1b | 815MB | ✅ ALERT | 5.4s |
-| llama3.2:1b | 1.3GB | ✅ ALERT | 7.1s |
+| Type | Description |
+|---|---|
+| `SensorReading { sensor_id, room_id, value, unit, timestamp_ms, normal_min, normal_max }` | Raw sensor data with normal range |
+| `Tile { id, room_id, tile_type, content, confidence, resolved_by, ... }` | A resolved observation |
+| `TileType` | `Status` / `Alert` / `Prediction` / `Anomaly` / `Coordination` / `Escalation` |
+| `ResolutionLayer` | `Algorithmic` → `NanoModel` → `RoomLora` → `FleetCoord` → `CloudEscalation` |
+| `TileExample { input, output, quality, layer }` | Training example for distillation |
 
-### Normal Detection (should say NORMAL)
+### Resolution Layers
 
-| Model | Size | Correct? | Latency |
-|-------|------|----------|---------|
-| Liquid LFM2.5-1.2B | 698MB | ❌ false ALERT | 1.3s |
-| phi4-mini | 2.5GB | ✅ NORMAL | 12.5s |
-| gemma3:1b | 815MB | ❌ false ALERT | 27.6s |
-| llama3.2:1b | 1.3GB | ❌ false ALERT | 18.6s |
+| Layer | What | When |
+|---|---|---|
+| 0 Algorithmic | Deadband, thresholds | Value changed > deadband |
+| 1 NanoModel | 350M parameter anomaly detection | Pattern looks unusual |
+| 2 RoomLora | 350M + LoRA room-specific adapter | Room-specific reasoning needed |
+| 3 FleetCoord | 1.2B cross-room coordinator | Multi-room correlation |
+| 4 CloudEscalation | Full LLM API call | Novel situation |
 
-**Key insight**: All models except phi4-mini have massive false positive rates. This is why Layer 0 (algorithmic deadband filtering) is critical — it catches normal readings before they reach the model. The model only sees already-suspicious inputs.
+### DeadbandFilter
 
-## Conservation Ratio
-
-CR tracks distillation quality at each layer transition:
-- L0 → L1: CR ≈ 0.99 (algorithmic extraction preserves almost everything)
-- L1 → L2: CR ≈ 0.95 (nano to LoRA, slight loss)
-- L2 → L3: CR ≈ 0.90 (room to fleet, coordination overhead)
-- L3 → L4: CR ≈ 0.80 (fleet to cloud, context compression)
-
-## Ecosystem
-
-plato-nervous is the core of the **PLATO Nervous System** — a room-specific intelligence signal chain.
-
-**Where this sits:** Layers 0 (deadband), 1 (nano 350M), and 3 (fleet 1.2B), plus the distillation pipeline. This is the backbone crate.
-
-**Signal chain:**
-```
-Sensor → Deadband(L0) → Nano 350M(L1) → Room LoRA(L2) → Fleet 1.2B(L3) → Cloud(L4)
-         plato-nervous    plato-nervous    distillation    plato-nervous     BYOK
-         vision-jepa      concrete-token   pipeline        luciddreamer      
-         audio-jepa       demo             plato-browser                     
+```rust
+let mut filter = DeadbandFilter { deadband: 0.5, last_value: None };
+filter.should_pass(22.5); // true (first value)
+filter.should_pass(22.6); // false (within deadband)
+filter.should_pass(23.2); // true (exceeds deadband)
 ```
 
-| Repo | Role |
-|------|------|
-| [plato-vision-jepa](https://github.com/SuperInstance/plato-vision-jepa) | 16-dim vision state vectors for RoomStateVector fusion |
-| [plato-audio-jepa](https://github.com/SuperInstance/plato-audio-jepa) | 16-dim audio state vectors for RoomStateVector fusion |
-| [concrete-token-demo](https://github.com/SuperInstance/concrete-token-demo) | CLI demo exercising this crate end-to-end |
-| [plato-browser](https://github.com/SuperInstance/plato-browser) | Browser-native zero-install demo (Chrome built-in AI) |
-| [luciddreamer-ai](https://github.com/SuperInstance/luciddreamer-ai) | Cloud-layer reactive improv podcast engine |
-| [openconstruct-kernel](https://github.com/SuperInstance/openconstruct-kernel) | Hardware detection feeding raw sensor ticks into L0 |
-| [hermit-crab](https://github.com/SuperInstance/hermit-crab) | Agent migration between rooms with CR tracking |
+### Ollama Integration (`ollama` module)
 
-See [DEPENDENCIES.md](./DEPENDENCIES.md) for detailed dependency and data flow information.
+Integration with local Ollama for nano-model and LoRA inference.
+
+## Testing
+
+45 tests covering: sensor reading handling, deadband filtering, tile creation across all resolution layers, escalation logic, and the full signal chain pipeline.
 
 ## License
 
-Apache 2.0
+Apache-2.0
